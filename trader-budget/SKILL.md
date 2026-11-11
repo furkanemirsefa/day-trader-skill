@@ -58,7 +58,7 @@ If `trader/config.json` does not exist, copy `config.example.json` into
 - **max_position_pct**, **max_order_usd**, **min_order_usd**: the biggest position (75% of the
   budget), the biggest order ($4,000) and the smallest order ($5).
 - The day limits trader-risk enforces: **max_daily_loss_usd** (150), **max_trades_per_day** (3),
-  **min_reward_risk** (1.0), **require_stop** (true), **no_entries_before** / **no_entries_after**
+  **min_reward_risk** (1.0), **commission_per_order_usd** (0; two are taken out of the max loss), **require_stop** (true), **no_entries_before** / **no_entries_after**
   ("09:45" / "15:30") and **flat_by** ("15:55"), all New York time.
 - **blocked**: tickers they never want to trade.
 - Keep **paper** true until they have watched it work on a paper account.

@@ -68,7 +68,7 @@ batch that is fine order by order but breaks a limit together is caught.
 | size | (entries) under `min_order_usd` or over `max_order_usd` |
 | position | (entries) the stock would be over `max_position_pct` of the account |
 | cash | (entries) the buy would leave less than the cash buffer, or need margin |
-| stop | (entries) no stop while `require_stop` is true (a bracket `stop_loss_stop_price`, or the order's plan stop); a stop on the wrong side of the entry |
+| stop | (entries) no stop at the broker while `require_stop` is true (a bracket `stop_loss_stop_price`; a stop that is only in the order's plan does not count); a stop on the wrong side of the entry |
 | loss | (entries) qty x (entry minus stop) over `max_loss_per_trade_usd` |
 | reward:risk | (entries) (target minus entry) / (entry minus stop) under `min_reward_risk` |
 | daily loss | (entries) the max losses at the stops of today's entries, plus this one, over `max_daily_loss_usd` |
@@ -83,10 +83,22 @@ How the numbers work:
 - **The entry it measures from**: the limit price for a limit order. For a
   market order, the HIGHER of the plan's entry and a fresh price from
   `trader/prices.json` (under 15 minutes old). A plan written at 10:15 cannot
-  understate the risk at 10:55 after the price ran up. An older price is not
-  used, and it says so.
-- **Daily loss** counts the full max loss of every entry placed today, win or
-  lose, as trader-broker logged it. Three full-size trades use up a $150 day.
+  understate the risk at 10:55 after the price ran up. A market entry in
+  shares with no fresh price is blocked: get a quote
+  (`alerts.py quote SYM --write`) or use a limit order.
+- **Commissions**: set `commission_per_order_usd` to what your broker charges
+  per order (0 by default; Interactive Brokers' minimum is about $0.35 to $1).
+  Two of them, in and out, are added to the max loss and taken off the reward
+  before reward:risk is measured. On a small account this alone blocks most
+  trades, and that is the honest answer.
+- **Daily loss** counts the full max loss of every entry today, win or lose,
+  as trader-broker logged it, or the loss realized on today's recorded fills
+  if that is bigger (a stop that slipped, commissions). An order you said yes
+  to counts until it is recorded as denied or failed. Three full-size trades
+  use up a $150 day.
+- **A PASS lasts 5 minutes.** After that trader-broker asks for a new check.
+- **Unknown config keys are refused**, so a misspelled limit cannot fall back
+  to its default without you knowing.
 - **The window** is New York time, worked out in the tool (daylight saving
   included), never from the computer's clock zone. Weekends and NYSE holidays
   are closed. On a 1:00 p.m. early close the window ends 3 hours earlier too.

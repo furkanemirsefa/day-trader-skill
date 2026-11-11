@@ -118,10 +118,13 @@ class TheReel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "state", "risk.json")
             none = os.path.join(d, "none")
+            pp = os.path.join(d, "prices.json")
+            with open(pp, "w") as fh:
+                json.dump({"as_of": "2026-10-19T14:15:00Z", "prices": {"TSLA": 364.18}}, fh)
             buf = io.StringIO()
             with redirect_stdout(buf):
                 code = check.main(["--orders", TSLA_PATH, "--config", CFG_PATH, "--portfolio", none,
-                                   "--prices", none, "--state", none, "--now", NOW, "--out", out])
+                                   "--prices", pp, "--state", none, "--now", NOW, "--out", out])
             text = buf.getvalue()
             self.assertEqual(code, 0)
             self.assertIn("PASS  #1 buy TSLA 8 shares, entry", text)
@@ -155,7 +158,7 @@ class DayTradeChecks(unittest.TestCase):
         o = tsla()
         for k in ("order_class", "take_profit_limit_price", "stop_loss_stop_price"):
             o.pop(k)
-        res = self.one(o)
+        res = self.one(o, require_stop=False)
         self.assertEqual(verdicts(res), ["PASS"])
         self.assertIn("in the plan only", warnings(res))
         self.assertEqual(res["results"][0]["max_loss"], 46.88)
@@ -181,9 +184,8 @@ class DayTradeChecks(unittest.TestCase):
         for now in ("2026-10-19 11:30", "2026-10-19 10:15"):
             res = check.check([tsla()], cfg(), prices={"TSLA": 366.475}, now=at(now),
                               price_times={"TSLA": QUOTE_TIME})
-            self.assertEqual(verdicts(res), ["PASS"], now)
             self.assertEqual(res["results"][0]["entry_ref"], 364.18)
-            self.assertIn("older than 15 minutes", warnings(res))
+            self.assertIn("price: no fresh price for TSLA (under 15 minutes old)", reasons(res), now)
 
     def test_a_lower_price_does_not_shrink_the_risk(self):
         res = check.check([tsla()], cfg(), prices={"TSLA": 360.00}, now=at(NOW))
@@ -475,8 +477,10 @@ class Cli(unittest.TestCase):
             with redirect_stdout(buf):
                 self.assertEqual(check.main(base + ["--now", "2026-10-19 10:55"]), 1)
             self.assertIn("8 shares x 8.16 risk a share = $65.28", buf.getvalue())
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(check.main(base + ["--now", "2026-10-19 11:30"]), 0)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(check.main(base + ["--now", "2026-10-19 11:30"]), 1)
+            self.assertIn("price: no fresh price for TSLA", buf.getvalue())
 
     def test_v1_orders_with_a_v1_config_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -517,6 +521,58 @@ class Cli(unittest.TestCase):
         with redirect_stderr(err):
             self.assertEqual(check.main(["--orders", TSLA_PATH, "--today", "monday", "--no-write"]), 1)
         self.assertIn("--today wants", err.getvalue())
+
+
+class LiveGates(unittest.TestCase):
+    """What a small live account needs: costs, fresh prices, a stop at the broker, real losses."""
+
+    def test_an_unknown_config_key_is_refused(self):
+        with self.assertRaises(check.RiskError) as e:
+            check.check([tsla()], cfg(max_loss_per_trade=1), now=at(NOW))
+        self.assertIn("max_loss_per_trade", str(e.exception))
+
+    def test_commissions_count_in_max_loss_and_reward_risk(self):
+        o = bracket("AAA", 2, 25.00, 24.60, 25.40)
+        res = check.check([o], cfg(commission_per_order_usd=0.35), now=at(NOW))
+        r = res["results"][0]
+        self.assertEqual(r["max_loss"], 1.50)       # 2 x 0.40 at the stop + 0.35 in + 0.35 out
+        self.assertEqual(r["reward_risk"], 0.07)    # (0.80 - 0.70) / 1.50
+        self.assertIn("reward:risk: 0.07", reasons(res))
+        self.assertIn("commissions", reasons(res))
+
+    def test_a_stop_in_the_plan_only_is_not_a_stop(self):
+        o = tsla()
+        for k in ("order_class", "take_profit_limit_price", "stop_loss_stop_price"):
+            o.pop(k)
+        self.assertIn("stop: the stop 358.32 is in the plan only", reasons(check.check([o], cfg(), now=at(NOW))))
+
+    def test_a_market_entry_needs_a_fresh_price(self):
+        res = check.check([tsla()], cfg(), prices={"TSLA": 364.18}, now=at(NOW), price_times={})
+        self.assertIn("price: no fresh price for TSLA", reasons(res))
+        res = check.check([tsla()], cfg(), prices={"TSLA": 364.18}, now=at(NOW), price_times={"TSLA": at(NOW)})
+        self.assertEqual(verdicts(res), ["PASS"])
+        limit = tsla(type="limit", limit_price="364.18")
+        self.assertEqual(verdicts(check.check([limit], cfg(), now=at(NOW), price_times={})), ["PASS"])
+
+    def test_an_approved_order_counts_until_it_is_denied_or_failed(self):
+        yes = dict(placed("AAPL", status="approved"), fingerprint="f1")
+        res = check.check([tsla()], cfg(), state={"orders": [yes]}, now=at(NOW))
+        self.assertEqual((res["today"]["entries_placed"], res["today"]["loss_at_risk"]), (1, 46.88))
+        for status in ("denied", "failed"):
+            st = {"orders": [yes, dict(placed("AAPL", status=status), fingerprint="f1")]}
+            self.assertEqual(check.check([tsla()], cfg(), state=st, now=at(NOW))["today"]["entries_placed"], 0)
+        st = {"orders": [yes, dict(placed("AAPL"), fingerprint="f1")]}
+        self.assertEqual(check.check([tsla()], cfg(), state=st, now=at(NOW))["today"]["entries_placed"], 1)
+
+    def test_a_realized_loss_bigger_than_planned_is_the_one_counted(self):
+        def fill(side, price):
+            return {"symbol": "AAPL", "side": side, "status": "filled", "date": TODAY, "qty": "10", "price": price}
+        st = {"orders": [placed("AAPL", max_loss=10), fill("buy", 100.0), fill("sell", 95.0)]}
+        self.assertEqual(check.check([tsla()], cfg(), state=st, now=at(NOW))["today"]["loss_at_risk"], 50.0)
+        res = check.check([tsla()], cfg(commission_per_order_usd=1), state=st, now=at(NOW))
+        self.assertEqual(res["today"]["loss_at_risk"], 52.0)
+        st["orders"][-1]["price"] = 110.0           # a winner does not free up the planned risk
+        self.assertEqual(check.check([tsla()], cfg(), state=st, now=at(NOW))["today"]["loss_at_risk"], 10.0)
 
 
 if __name__ == "__main__":

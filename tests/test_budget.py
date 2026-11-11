@@ -25,7 +25,7 @@ CONTRACT_CFG = {
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "fractional": False, "broker": "alpaca", "paper": True, "blocked": [],
     "allow_options": False, "allow_margin": False, "allow_short": False, "pdt_guard": False,
-    "sec_user_agent": "Your Name you@example.com",
+    "commission_per_order_usd": 0, "sec_user_agent": "Your Name you@example.com",
 }
 # v1's rules, for the weights mode tests
 V1 = {"budget": 5000, "cash_buffer_pct": 10, "max_position_pct": 25, "max_order_usd": 2000, "min_order_usd": 5,
@@ -368,6 +368,12 @@ class WeightsMode(unittest.TestCase):
             code, _, err = run(["--targets", "/nonexistent/targets.json", "--config", c])
             self.assertEqual(code, 1)
             self.assertIn("no weights file", err)
+
+
+class Commissions(unittest.TestCase):
+    def test_commissions_come_out_of_the_max_loss(self):
+        s = size.size_trade(plan(), cfg(commission_per_order_usd=2), today=TODAY)
+        self.assertEqual((s["qty"], s["max_loss"]), (7, 45.02))    # (50 - 4) / 5.86 = 7 shares; 7 x 5.86 + 4
 
 
 if __name__ == "__main__":

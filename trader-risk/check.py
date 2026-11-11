@@ -73,8 +73,9 @@ DEFAULTS = {
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
-    "pdt_guard": False,
+    "pdt_guard": False, "commission_per_order_usd": 0,
 }
+KNOWN_KEYS = set(DEFAULTS) | {"fractional", "broker", "sec_user_agent"}   # the last three are other tools'
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
@@ -339,12 +340,31 @@ def rec_is_entry(rec):
 
 
 def placed_today(state, today):
-    """Orders recorded as placed today by trader-broker."""
-    out = []
+    """Orders placed today, or approved and not denied, failed or declined since:
+    a yes whose result was never recorded may be at the broker, so it counts."""
+    latest = {}
+    for n, rec in enumerate((state or {}).get("orders", [])):
+        if rec_day(rec) == today:
+            latest[rec.get("fingerprint") or n] = rec
+    return [r for r in latest.values() if r.get("status") in ("approved", "placed")]
+
+
+def realized_loss(state, today, commission=0.0):
+    """Dollars lost on today's round trips, from the fills in the log (0 when the day is up)."""
+    legs = {}
     for rec in (state or {}).get("orders", []):
-        if rec.get("status") == "placed" and rec_day(rec) == today:
-            out.append(rec)
-    return out
+        q, p, side = _f(rec.get("qty")), _f(rec.get("price")), str(rec.get("side", "")).lower()
+        if rec.get("status") == "filled" and rec_day(rec) == today and q and p and side in ("buy", "sell"):
+            leg = legs.setdefault(str(rec.get("symbol", "")).upper(), {"buy": [0.0, 0.0], "sell": [0.0, 0.0], "n": 0})
+            leg[side][0] += q
+            leg[side][1] += q * p
+            leg["n"] += 1
+    pnl = 0.0
+    for leg in legs.values():
+        (bq, cost), (sq, proceeds) = leg["buy"], leg["sell"]
+        if bq and sq:
+            pnl += min(bq, sq) * (proceeds / sq - cost / bq) - commission * leg["n"]
+    return max(0.0, -pnl)
 
 
 def day_trades(state, today):
@@ -377,6 +397,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
+    unknown = sorted(set(c) - KNOWN_KEYS)
+    if unknown:
+        raise RiskError("unknown config key%s %s: a misspelled limit would silently fall back to its default"
+                        % ("" if len(unknown) == 1 else "s", ", ".join(unknown)))
+    comm = _f(c.get("commission_per_order_usd")) or 0.0
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
     now_utc = now or parse_now(None)
     now_et = to_eastern(now_utc)
@@ -394,6 +419,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                             "the daily loss" % (r.get("side"), r.get("symbol")))
         else:
             loss_today += ml
+    # stop slippage, a worse fill and commissions show up only in the fills
+    loss_today = max(loss_today, round(realized_loss(state, today, comm), 2))
     placed_keys = {(str(r.get("symbol", "")).upper(), r.get("side")) for r in done_today}
     win_reasons, win_warns = window_check(now_et, c)
     pdt_n, pdt_list = day_trades(state, today) if c.get("pdt_guard") else (0, [])
@@ -501,9 +528,6 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                 % (sym, _p(ref), _p(plan_entry), _p(ref)))
             elif sym in prices:
                 ref, ref_from = prices[sym], "stale price"
-        if plan_entry and live is None and sym in prices and price_times is not None and typ == "market":
-            warns.append("the %s price in trader/prices.json is older than %d minutes: not used"
-                         % (sym, FRESH_MINUTES))
         q = _f(qty)
         if notional is not None and _f(notional):
             value = _f(notional)
@@ -523,6 +547,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         elif side == "buy" and held < -1e-9 and q is not None:
             exiting = q <= -held + 1e-9
         kind = "exit" if exiting else "entry"
+        if kind == "entry" and typ == "market" and q and price_times is not None and live is None:
+            later.append("price: no fresh price for %s (under %d minutes old), so the plan's entry may be far "
+                         "from the market. Get one (trader-alerts: alerts.py quote %s --write) or use a limit order"
+                         % (sym, FRESH_MINUTES, sym))
         if kind == "entry" and value is None and q:
             later.append("price: no price for %s to size a %s-share order; add it to "
                          "trader/prices.json (trader-alerts: alerts.py quote %s --write)" % (sym, qty, sym))
@@ -578,8 +606,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 warns.append("the bracket stop %s differs from the plan's stop %s: the bracket's is the one "
                              "the broker uses" % (_p(leg_stop), _p(plan_stop)))
             if stop and not leg_stop:
-                warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
-                             "(trader-alerts: alerts.py add --from-plan)" % _p(stop))
+                if c.get("require_stop", True):
+                    later.append("stop: the stop %s is in the plan only, not at the broker. Every entry needs "
+                                 "a bracket stop_loss_stop_price (\"require_stop\": true)" % _p(stop))
+                else:
+                    warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
+                                 "(trader-alerts: alerts.py add --from-plan)" % _p(stop))
             if not stop:
                 if c.get("require_stop", True):
                     later.append("stop: no stop. Every entry needs one (\"require_stop\": true): a bracket "
@@ -594,21 +626,25 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     risk_c = int(round(abs(ref - stop) * 100))
                     risk_ps = risk_c / 100.0
                     shares = q if q is not None else ((value or 0) / ref)
-                    max_loss = round(shares * risk_ps, 2)
+                    costs = (" plus %s commissions in and out" % money(2 * comm)) if comm else ""
+                    max_loss = round(shares * risk_ps + 2 * comm, 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
-                        later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
+                        later.append("loss: %s shares x %s risk a share%s = %s at the stop, over your %s max loss "
+                                     "per trade" % (_num(shares), _p(risk_ps), costs, money(max_loss), money(cap)))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
                         if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
                             later.append("target: the target %s must be %s the entry %s"
                                          % (_p(target), "above" if long else "below", _p(ref)))
                         else:
-                            rr = round(int(round(abs(target - ref) * 100)) / float(risk_c), 2)
-                            if min_rr and rr < min_rr - 1e-9:
-                                later.append("reward:risk: %.2f (target %s, entry %s, stop %s) is under your "
-                                             "minimum %s" % (rr, _p(target), _p(ref), _p(stop), _num(min_rr)))
+                            per = 200 * comm / shares if shares else 0.0    # commissions, cents a share
+                            exact = (int(round(abs(target - ref) * 100)) - per) / (risk_c + per)
+                            rr = round(exact, 2)
+                            if min_rr and exact < min_rr - 1e-9:
+                                later.append("reward:risk: %.2f (target %s, entry %s, stop %s%s) is under your "
+                                             "minimum %s" % (rr, _p(target), _p(ref), _p(stop),
+                                                             costs.replace(" plus", ", after"), _num(min_rr)))
                     elif min_rr:
                         later.append("reward:risk: no target to measure it against (min_reward_risk %s)"
                                      % _num(min_rr))
@@ -800,8 +836,7 @@ def main(argv=None):
             if d:
                 os.makedirs(d, exist_ok=True)
             rec = dict(res)
-            rec["checked_at"] = datetime.datetime.now(datetime.timezone.utc).replace(
-                microsecond=0, tzinfo=None).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rec["checked_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")   # the clock the check used: ticket.py ages it
             rec["orders_file"] = a.orders
             tmp = a.out + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
