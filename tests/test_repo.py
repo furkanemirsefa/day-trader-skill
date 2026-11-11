@@ -39,8 +39,9 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        # trader/ is this fork's own paper-trading state, not part of the pack
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d != "trader")
+        # trader/ and CLAUDE.md are this fork's own state and session rules, not part of the pack
+        root = sorted(d for d in os.listdir(ROOT)
+                      if not d.startswith(".git") and d not in ("trader", "CLAUDE.md"))
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
