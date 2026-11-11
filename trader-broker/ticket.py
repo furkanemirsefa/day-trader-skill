@@ -51,6 +51,7 @@ TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at t
              "cls": "at the close", "ioc": "immediate or cancel", "fok": "fill or kill"}
 YES_WORDS = ("yes", "y")
 BATCH_WORDS = {"all", "every", "everything", "rest", "remaining", "them", "both", "batch", "each"}
+PASS_MINUTES = 5      # a PASS older than this is checked again: the price and the clock have moved
 DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "maybe", "later",
                "hold", "unless", "if"}
 
@@ -312,26 +313,35 @@ def latest(state, fp, today):
     return found
 
 
-def risk_verdict(risk, fp, today):
+def risk_verdict(risk, fp, today, now=None):
+    """now (naive UTC) also ages the check; None skips that (an order already decided)."""
     if not risk:
         return None, "trader-risk has not checked these orders (run check.py)"
     if risk.get("date") != today:
         return None, "the risk check is from %s, not today; run check.py again" % risk.get("date")
+    if now is not None:
+        try:
+            age = (now - datetime.datetime.strptime(str(risk.get("checked_at")), "%Y-%m-%dT%H:%M:%SZ")).total_seconds()
+        except ValueError:
+            return None, "the risk check has no time on it; run check.py again"
+        if not -60 <= age <= PASS_MINUTES * 60:
+            return None, ("the risk check is %d minutes old (a PASS lasts %d); run check.py again"
+                          % (age // 60, PASS_MINUTES))
     for r in risk.get("results", []):
         if r.get("fingerprint") == fp:
             return r, None
     return None, "this exact order was not in the last risk check (it changed or is new); run check.py again"
 
 
-def status_of(order, risk, state, today):
+def status_of(order, risk, state, today, now=None):
     """(ready, label, risk_result)"""
     fp = fingerprint(order)
-    rv, why = risk_verdict(risk, fp, today)
+    rec = latest(state, fp, today)
+    rv, why = risk_verdict(risk, fp, today, None if rec else now)
     if rv is None:
         return False, "NOT READY: " + why, None
     if rv.get("verdict") != "PASS":
         return False, "BLOCKED by trader-risk: " + "; ".join(rv.get("reasons", [])), rv
-    rec = latest(state, fp, today)
     if rec:
         st = rec.get("status")
         if st == "approved":
@@ -349,8 +359,8 @@ def kind_of(order, rv):
 
 # ---------------------------------------------------------------- rendering
 
-def render(order, idx, total, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+def render(order, idx, total, cfg, risk, state, today, now=None):
+    ready, label, rv = status_of(order, risk, state, today, now)
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
@@ -379,8 +389,8 @@ def render(order, idx, total, cfg, risk, state, today):
     return "\n".join(lines), ready
 
 
-def ticket_json(order, idx, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+def ticket_json(order, idx, cfg, risk, state, today, now=None):
+    ready, label, rv = status_of(order, risk, state, today, now)
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
@@ -483,12 +493,12 @@ def cmd_show(a):
     orders, cfg, risk, state, today, now = _load(a)
     picks = [(a.index, _pick(orders, a.index))] if a.index else list(enumerate(orders, 1))
     if a.json:
-        out = [ticket_json(o, i, cfg, risk, state, today) for i, o in picks]
+        out = [ticket_json(o, i, cfg, risk, state, today, now) for i, o in picks]
         print(json.dumps(out[0] if a.index else out, indent=2))
         return 0 if any(t["ready"] for t in out) else 1
     blocks, any_ready = [], False
     for i, o in picks:
-        text, ready = render(o, i, len(orders), cfg, risk, state, today)
+        text, ready = render(o, i, len(orders), cfg, risk, state, today, now)
         blocks.append(text)
         any_ready = any_ready or ready
     print("\n\n".join(blocks))
@@ -500,7 +510,7 @@ def cmd_show(a):
 def cmd_approve(a):
     orders, cfg, risk, state, today, now = _load(a)
     order = _pick(orders, a.index)
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv = status_of(order, risk, state, today, now)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])
@@ -508,6 +518,8 @@ def cmd_approve(a):
         print("Not recorded: %s. Ask the user again with the ticket for order %d." % (why, a.index))
         return 1
     loss, stop = max_loss(order)
+    if rv.get("max_loss") is not None:
+        loss = rv["max_loss"]       # what trader-risk measured: "plan" is a note outside the fingerprint
     rec = {"at": ny_iso(now), "date": today, "index": a.index, "fingerprint": fingerprint(order),
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,

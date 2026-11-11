@@ -23,7 +23,7 @@ The Order Executor is the only skill in this pack that can lead to a real
 order, so it is the strictest. An order reaches the market only after three
 separate gates, every time, for every order:
 
-1. **trader-risk passed this exact order today** (matched by fingerprint).
+1. **trader-risk passed this exact order in the last 5 minutes** (matched by fingerprint).
 2. **The user typed an explicit yes for this one order** in the chat.
 3. **The user clicked Allow once** on Claude's own permission card, which
    appears because the order tool is set to "Needs approval".

@@ -123,9 +123,12 @@ class Flow(unittest.TestCase):
                               "--state", self.state, "--now", kw.get("now", NOW)]
 
     def run_risk(self, now=NOW):
+        prices = os.path.join(self.d, "prices.json")      # a market entry needs a fresh quote
+        with open(prices, "w") as fh:
+            json.dump({"as_of": check.parse_now(now).strftime("%Y-%m-%dT%H:%M:%SZ"), "prices": {"TSLA": 364.18}}, fh)
         with redirect_stdout(io.StringIO()):
             return check.main(["--orders", self.orders, "--config", self.cfg, "--portfolio", self.pf,
-                               "--prices", self.none, "--state", self.state, "--now", now, "--out", self.risk])
+                               "--prices", prices, "--state", self.state, "--now", now, "--out", self.risk])
 
     def state_doc(self):
         with open(self.state) as fh:
@@ -301,6 +304,24 @@ class Flow(unittest.TestCase):
                             "--portfolio", self.pf, "--config", self.cfg, "--state", self.state])
         self.assertEqual(code, 1)
         self.assertNotIn("Traceback", err)
+    def test_a_pass_goes_stale_after_five_minutes(self):
+        self.run_risk()
+        self.assertIn("READY: trader-risk PASS", run(self.args("show", "--index", "1", now="2026-10-19 10:19"))[1])
+        code, text, _ = run(self.args("show", "--index", "1", now="2026-10-19 10:21"))
+        self.assertEqual(code, 1)
+        self.assertIn("6 minutes old", text)
+        code, _, _ = run(self.args("approve", "--index", "1", "--reply", "yes", now="2026-10-19 10:21"))
+        self.assertEqual(code, 1)
+
+    def test_the_logged_max_loss_is_the_risk_checks_not_the_plans(self):
+        self.run_risk()
+        with open(self.orders) as fh:
+            doc = json.load(fh)
+        doc["orders"][0]["plan"]["max_loss"] = 0.01     # "plan" is outside the fingerprint
+        with open(self.orders, "w") as fh:
+            json.dump(doc, fh)
+        run(self.args("approve", "--index", "1", "--reply", "yes"))
+        self.assertEqual(self.state_doc()["orders"][0]["max_loss"], 46.88)
 
 
 if __name__ == "__main__":

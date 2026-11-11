@@ -82,6 +82,7 @@ DEFAULTS = {
     "allow_margin": False,
     "allow_short": False,
     "pdt_guard": False,
+    "commission_per_order_usd": 0,
 }
 EPS = 1e-9
 FRESH_MINUTES = 15
@@ -365,9 +366,11 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
 
     limits = []
     max_loss = _f(c.get("max_loss_per_trade_usd"))
+    comm2 = 2 * (_f(c.get("commission_per_order_usd")) or 0.0)      # one order in, one out
     if max_loss:
-        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss, risk),
-                       "how": "%s max loss / %s risk a share" % (money(max_loss), _price(risk))})
+        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss - comm2, risk),
+                       "how": "%s max loss%s / %s risk a share"
+                       % (money(max_loss), (" minus %s commissions" % money(comm2)) if comm2 else "", _price(risk))})
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
@@ -385,7 +388,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     for l in limits:
         l["binds"] = l["name"] == bound[0]
     cost = round(qty * ref, 2)
-    loss = round(qty * risk_c / 100.0, 2)
+    loss = round(qty * risk_c / 100.0 + (comm2 if qty else 0), 2)
     refusal = None
     if qty == 0:
         if bound[0] == "max loss":
@@ -410,7 +413,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "stop_label": plan.get("stop_label", ""), "target_label": plan.get("target_label", ""),
         "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
-        "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
+        "cost": cost, "max_loss": loss, "commissions": comm2, "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
     }
 
@@ -424,11 +427,12 @@ def bracket_order(s):
     if s["order_type"] == "limit":
         o["limit_price"] = _price(s["entry"])
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
-    why = ("%s on %s: %d shares, bound by your %s (%d x %s = %s at the stop)"
+    why = ("%s on %s: %d shares, bound by your %s (%d x %s%s = %s at the stop)"
            % (setup, s["symbol"], s["qty"], {"max loss": "%s max loss per trade" % money(s["max_loss_per_trade_usd"] or 0),
                                              "position cap": "position cap", "max order": "max order",
                                              "cash": "cash after the buffer"}[s["bound_by"]],
-              s["qty"], _price(s["risk_per_share"]), money(s["max_loss"])))
+              s["qty"], _price(s["risk_per_share"]),
+              (" + %s commissions" % money(s["commissions"])) if s["commissions"] else "", money(s["max_loss"])))
     o.update({
         "order_class": "bracket",
         "take_profit_limit_price": _price(s["target"]),
@@ -466,9 +470,10 @@ def plan_report(s, order, notes=()):
         lines.append("No order: " + s["refusal"])
         lines.append("Education and tooling, not financial advice.")
         return "\n".join(lines)
-    lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
+    lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s%s = %s."
                  % (s["qty"], s["symbol"], money(s["cost"]), _price(s["entry"]), s["qty"],
-                    _price(s["risk_per_share"]), money(s["max_loss"])))
+                    _price(s["risk_per_share"]),
+                    (" + %s commissions" % money(s["commissions"])) if s["commissions"] else "", money(s["max_loss"])))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
     lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
